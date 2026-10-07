@@ -311,7 +311,14 @@ func (e *OpenAICompatExecutor) executeImages(ctx context.Context, auth *cliproxy
 	}
 
 	reporter.ObserveResponseModel(body)
-	reporter.Publish(ctx, helps.ParseOpenAIUsage(body))
+	detail := helps.ParseOpenAIUsage(body)
+	if detail.OutputTokens > 0 && detail.ImageOutputTokens == 0 {
+		detail.ImageOutputTokens = detail.OutputTokens
+	}
+	if endpointPath == openAICompatImagesGenerationsPath {
+		detail.ImageTokensKnown = true
+	}
+	reporter.Publish(ctx, detail)
 	reporter.EnsurePublished(ctx)
 	resp = cliproxyexecutor.Response{Payload: body, Headers: httpResp.Header.Clone()}
 	return resp, nil

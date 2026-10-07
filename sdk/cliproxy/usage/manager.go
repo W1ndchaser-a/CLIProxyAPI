@@ -65,6 +65,8 @@ type Record struct {
 	Failed      bool
 	Fail        Failure
 	Detail      Detail
+	// BillingTokenDetails embeds fine-grained multimodal and cache TTL sub-bucket metrics.
+	BillingTokenDetails
 	// ResponseHeaders stores a snapshot of upstream response headers for usage sinks.
 	ResponseHeaders http.Header
 }
@@ -73,6 +75,18 @@ type Record struct {
 type Failure struct {
 	StatusCode int
 	Body       string
+}
+
+// BillingTokenDetails contains fine-grained multimodal and cache TTL sub-bucket metrics.
+// All sub-buckets are subsets of existing total buckets (InputTokens, CacheReadTokens,
+// OutputTokens, CacheCreationTokens) and must never duplicate token counts.
+type BillingTokenDetails struct {
+	ImageInputTokens      int64 `json:"image_input_tokens"`
+	ImageCacheReadTokens  int64 `json:"image_cache_read_tokens"`
+	ImageOutputTokens     int64 `json:"image_output_tokens"`
+	CacheCreation1hTokens int64 `json:"cache_creation_1h_tokens"`
+	ImageTokensKnown      bool  `json:"image_tokens_known"`
+	CacheCreationTTLKnown bool  `json:"cache_creation_ttl_known"`
 }
 
 // Detail holds the token usage breakdown.
@@ -86,8 +100,8 @@ type Detail struct {
 	TotalTokens         int64
 	TokenBreakdown      TokenBreakdown
 	ResponseServiceTier string
+	BillingTokenDetails
 }
-
 type requestedModelAliasContextKey struct{}
 type reasoningEffortContextKey struct{}
 type serviceTierContextKey struct{}
@@ -404,6 +418,11 @@ func (m *Manager) Publish(ctx context.Context, record Record) {
 		} else if trID := internallogging.GetRequestID(ctx); trID != "" {
 			record.TraceID = trID
 		}
+	}
+	if record.BillingTokenDetails == (BillingTokenDetails{}) && record.Detail.BillingTokenDetails != (BillingTokenDetails{}) {
+		record.BillingTokenDetails = record.Detail.BillingTokenDetails
+	} else if record.Detail.BillingTokenDetails == (BillingTokenDetails{}) && record.BillingTokenDetails != (BillingTokenDetails{}) {
+		record.Detail.BillingTokenDetails = record.BillingTokenDetails
 	}
 	// ensure worker is running even if Start was not called explicitly
 	m.Start(context.Background())

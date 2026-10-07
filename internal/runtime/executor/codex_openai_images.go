@@ -382,7 +382,15 @@ func (e *CodexExecutor) executeDirectOpenAIImage(ctx context.Context, auth *clip
 		return resp, err
 	}
 
-	reporter.Publish(ctx, helps.ParseOpenAIUsage(data))
+	reporter.ObserveResponseModel(data)
+	detail := helps.ParseOpenAIUsage(data)
+	if detail.OutputTokens > 0 && detail.ImageOutputTokens == 0 {
+		detail.ImageOutputTokens = detail.OutputTokens
+	}
+	if endpointPath == codexDirectImagesGenerations {
+		detail.ImageTokensKnown = true
+	}
+	reporter.Publish(ctx, detail)
 	reporter.EnsurePublished(ctx)
 	return cliproxyexecutor.Response{Payload: data, Headers: httpResp.Header.Clone()}, nil
 }
@@ -453,6 +461,15 @@ func (e *CodexExecutor) executeDirectOpenAIImageStream(ctx context.Context, auth
 		defer func() {
 			if errClose := httpResp.Body.Close(); errClose != nil {
 				log.Errorf("codex executor: close response body error: %v", errClose)
+			}
+			if detail, ok := streamUsage.Detail(); ok {
+				if detail.OutputTokens > 0 && detail.ImageOutputTokens == 0 {
+					detail.ImageOutputTokens = detail.OutputTokens
+				}
+				if endpointPath == codexDirectImagesGenerations {
+					detail.ImageTokensKnown = true
+				}
+				streamUsage.Observe(detail, true)
 			}
 			streamUsage.Publish(ctx, reporter)
 			reporter.EnsurePublished(ctx)

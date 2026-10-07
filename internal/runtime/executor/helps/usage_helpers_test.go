@@ -1268,3 +1268,257 @@ func TestUsageReporter_ExplicitTraceIDPrecedenceOverLogRequestID(t *testing.T) {
 		t.Fatalf("record.TraceID = %q, want explicit-trace-1", record.TraceID)
 	}
 }
+
+func TestParseClaudeUsage_Extracts1hCacheCreationAndSpeedFast(t *testing.T) {
+	data := []byte(`{
+		"id": "msg_01",
+		"type": "message",
+		"speed": "fast",
+		"usage": {
+			"input_tokens": 1000,
+			"output_tokens": 500,
+			"cache_read_input_tokens": 10000,
+			"cache_creation_input_tokens": 50000,
+			"cache_creation": {
+				"ephemeral_5m_input_tokens": 20000,
+				"ephemeral_1h_input_tokens": 30000
+			}
+		}
+	}`)
+
+	detail := ParseClaudeUsage(data)
+	if detail.InputTokens != 1000 {
+		t.Fatalf("InputTokens = %d, want 1000", detail.InputTokens)
+	}
+	if detail.OutputTokens != 500 {
+		t.Fatalf("OutputTokens = %d, want 500", detail.OutputTokens)
+	}
+	if detail.CacheReadTokens != 10000 {
+		t.Fatalf("CacheReadTokens = %d, want 10000", detail.CacheReadTokens)
+	}
+	if detail.CacheCreationTokens != 50000 {
+		t.Fatalf("CacheCreationTokens = %d, want 50000", detail.CacheCreationTokens)
+	}
+	if detail.CacheCreation1hTokens != 30000 {
+		t.Fatalf("CacheCreation1hTokens = %d, want 30000", detail.CacheCreation1hTokens)
+	}
+	if !detail.CacheCreationTTLKnown {
+		t.Fatalf("CacheCreationTTLKnown = false, want true")
+	}
+	if detail.ResponseServiceTier != "fast" {
+		t.Fatalf("ResponseServiceTier = %q, want fast", detail.ResponseServiceTier)
+	}
+}
+
+func TestParseGeminiUsage_ExtractsModalityBreakdown(t *testing.T) {
+	data := []byte(`{
+		"usageMetadata": {
+			"promptTokenCount": 100,
+			"candidatesTokenCount": 1300,
+			"thoughtsTokenCount": 20,
+			"totalTokenCount": 1420,
+			"promptTokensDetails": [
+				{"modality": "TEXT", "tokenCount": 80},
+				{"modality": "IMAGE", "tokenCount": 20}
+			],
+			"candidatesTokensDetails": [
+				{"modality": "TEXT", "tokenCount": 180},
+				{"modality": "IMAGE", "tokenCount": 1120}
+			]
+		}
+	}`)
+
+	detail := ParseGeminiUsage(data)
+	if detail.InputTokens != 100 {
+		t.Fatalf("InputTokens = %d, want 100", detail.InputTokens)
+	}
+	if detail.OutputTokens != 1300 {
+		t.Fatalf("OutputTokens = %d, want 1300", detail.OutputTokens)
+	}
+	if detail.ReasoningTokens != 20 {
+		t.Fatalf("ReasoningTokens = %d, want 20", detail.ReasoningTokens)
+	}
+	if detail.ImageInputTokens != 20 {
+		t.Fatalf("ImageInputTokens = %d, want 20", detail.ImageInputTokens)
+	}
+	if detail.ImageOutputTokens != 1120 {
+		t.Fatalf("ImageOutputTokens = %d, want 1120", detail.ImageOutputTokens)
+	}
+	if !detail.ImageTokensKnown {
+		t.Fatalf("ImageTokensKnown = false, want true")
+	}
+}
+
+func TestParseOpenAIUsage_ExtractsGPTImageModalities(t *testing.T) {
+	data := []byte(`{
+		"usage": {
+			"prompt_tokens": 100,
+			"completion_tokens": 50,
+			"total_tokens": 150,
+			"input_tokens_details": {
+				"image_tokens": 80,
+				"cached_tokens": 20,
+				"cached_tokens_details": {
+					"image_tokens": 15
+				}
+			},
+			"output_tokens_details": {
+				"image_tokens": 50
+			}
+		}
+	}`)
+
+	detail := ParseOpenAIUsage(data)
+	if detail.InputTokens != 100 {
+		t.Fatalf("InputTokens = %d, want 100", detail.InputTokens)
+	}
+	if detail.OutputTokens != 50 {
+		t.Fatalf("OutputTokens = %d, want 50", detail.OutputTokens)
+	}
+	if detail.CachedTokens != 20 || detail.CacheReadTokens != 20 {
+		t.Fatalf("CachedTokens = %d, want 20", detail.CachedTokens)
+	}
+	if detail.ImageInputTokens != 80 {
+		t.Fatalf("ImageInputTokens = %d, want 80", detail.ImageInputTokens)
+	}
+	if detail.ImageCacheReadTokens != 15 {
+		t.Fatalf("ImageCacheReadTokens = %d, want 15", detail.ImageCacheReadTokens)
+	}
+	if detail.ImageOutputTokens != 50 {
+		t.Fatalf("ImageOutputTokens = %d, want 50", detail.ImageOutputTokens)
+	}
+	if !detail.ImageTokensKnown {
+		t.Fatalf("ImageTokensKnown = false, want true")
+	}
+}
+
+func TestParseCodexImageToolUsage_MarksOutputAsImageTokens(t *testing.T) {
+	data := []byte(`{
+		"response": {
+			"tool_usage": {
+				"image_gen": {
+					"input_tokens": 10,
+					"output_tokens": 25,
+					"total_tokens": 35
+				}
+			}
+		}
+	}`)
+
+	detail, ok := ParseCodexImageToolUsage(data)
+	if !ok {
+		t.Fatalf("ParseCodexImageToolUsage failed")
+	}
+	if detail.OutputTokens != 25 {
+		t.Fatalf("OutputTokens = %d, want 25", detail.OutputTokens)
+	}
+	if detail.ImageOutputTokens != 25 {
+		t.Fatalf("ImageOutputTokens = %d, want 25", detail.ImageOutputTokens)
+	}
+	if !detail.ImageTokensKnown {
+		t.Fatalf("ImageTokensKnown = false, want true")
+	}
+}
+
+func TestStreamUsageBuffer_ClaudeStreamMergesFirstFrameCacheAndLastFrameOutput(t *testing.T) {
+	firstLine := []byte(`data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-3-7-sonnet","speed":"fast","usage":{"input_tokens":1000,"cache_creation_input_tokens":50000,"cache_read_input_tokens":10000,"cache_creation":{"ephemeral_5m_input_tokens":20000,"ephemeral_1h_input_tokens":30000}}}}`)
+	deltaLine := []byte(`data: {"type":"message_delta","usage":{"output_tokens":500}}`)
+
+	var buffer StreamUsageBuffer
+	buffer.ObserveClaudeStream(firstLine)
+	buffer.ObserveClaudeStream(deltaLine)
+
+	detail, ok := buffer.Detail()
+	if !ok {
+		t.Fatalf("buffer.Detail() not ok")
+	}
+	if detail.InputTokens != 1000 {
+		t.Fatalf("InputTokens = %d, want 1000", detail.InputTokens)
+	}
+	if detail.CacheReadTokens != 10000 {
+		t.Fatalf("CacheReadTokens = %d, want 10000", detail.CacheReadTokens)
+	}
+	if detail.CacheCreationTokens != 50000 {
+		t.Fatalf("CacheCreationTokens = %d, want 50000", detail.CacheCreationTokens)
+	}
+	if detail.CacheCreation1hTokens != 30000 {
+		t.Fatalf("CacheCreation1hTokens = %d, want 30000", detail.CacheCreation1hTokens)
+	}
+	if !detail.CacheCreationTTLKnown {
+		t.Fatalf("CacheCreationTTLKnown = false, want true")
+	}
+	if detail.OutputTokens != 500 {
+		t.Fatalf("OutputTokens = %d, want 500", detail.OutputTokens)
+	}
+	if detail.ResponseServiceTier != "fast" {
+		t.Fatalf("ResponseServiceTier = %q, want fast", detail.ResponseServiceTier)
+	}
+}
+
+func TestParseOpenAIUsage_PartialImageBreakdownResultsInImageTokensKnownFalse(t *testing.T) {
+	data := []byte(`{
+		"usage": {
+			"prompt_tokens": 100,
+			"completion_tokens": 50,
+			"total_tokens": 150,
+			"output_tokens_details": {
+				"image_tokens": 50
+			}
+		}
+	}`)
+
+	detail := ParseOpenAIUsage(data)
+	if detail.ImageOutputTokens != 50 {
+		t.Fatalf("ImageOutputTokens = %d, want 50", detail.ImageOutputTokens)
+	}
+	if detail.ImageTokensKnown {
+		t.Fatalf("ImageTokensKnown = true, want false because input image tokens are missing while InputTokens > 0")
+	}
+}
+
+func TestParseOpenAIUsage_MissingCacheImageBreakdownResultsInImageTokensKnownFalse(t *testing.T) {
+	data := []byte(`{
+		"usage": {
+			"prompt_tokens": 100,
+			"completion_tokens": 50,
+			"total_tokens": 150,
+			"input_tokens_details": {
+				"image_tokens": 80,
+				"cached_tokens": 20
+			},
+			"output_tokens_details": {
+				"image_tokens": 50
+			}
+		}
+	}`)
+
+	detail := ParseOpenAIUsage(data)
+	if detail.ImageInputTokens != 80 || detail.ImageOutputTokens != 50 {
+		t.Fatalf("Image tokens input=%d output=%d, want 80/50", detail.ImageInputTokens, detail.ImageOutputTokens)
+	}
+	if detail.ImageTokensKnown {
+		t.Fatalf("ImageTokensKnown = true, want false because cached image tokens are missing while CacheReadTokens > 0")
+	}
+}
+
+func TestParseGeminiUsage_PartialModalityArraysResultsInImageTokensKnownFalse(t *testing.T) {
+	data := []byte(`{
+		"usageMetadata": {
+			"promptTokenCount": 100,
+			"candidatesTokenCount": 1300,
+			"totalTokenCount": 1400,
+			"candidatesTokensDetails": [
+				{"modality": "TEXT", "tokenCount": 180},
+				{"modality": "IMAGE", "tokenCount": 1120}
+			]
+		}
+	}`)
+
+	detail := ParseGeminiUsage(data)
+	if detail.ImageOutputTokens != 1120 {
+		t.Fatalf("ImageOutputTokens = %d, want 1120", detail.ImageOutputTokens)
+	}
+	if detail.ImageTokensKnown {
+		t.Fatalf("ImageTokensKnown = true, want false because promptTokensDetails is missing while promptTokenCount > 0")
+	}
+}

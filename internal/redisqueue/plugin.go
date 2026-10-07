@@ -100,6 +100,7 @@ func (p *usageQueuePlugin) HandleUsage(ctx context.Context, record coreusage.Rec
 		CacheReadTokensPresent: true,
 		CacheCreationTokens:    usageDetail.CacheCreationTokens,
 		TotalTokens:            usageDetail.TotalTokens,
+		BillingTokenDetails:    usageDetail.BillingTokenDetails,
 	}
 
 	failed := record.Failed
@@ -155,6 +156,7 @@ func (p *usageQueuePlugin) HandleUsage(ctx context.Context, record coreusage.Rec
 		ServiceTier:         serviceTier,
 		ResponseServiceTier: responseServiceTier,
 		ResponseModel:       responseModel,
+		BillingTokenDetails: usageDetail.BillingTokenDetails,
 	})
 	if err != nil {
 		return
@@ -185,6 +187,7 @@ type queuedUsageDetail struct {
 	ServiceTier         string                   `json:"service_tier"`
 	ResponseServiceTier string                   `json:"response_service_tier,omitempty"`
 	ResponseModel       string                   `json:"response_model,omitempty"`
+	coreusage.BillingTokenDetails
 }
 
 type requestDetail struct {
@@ -215,6 +218,7 @@ type tokenStats struct {
 	CacheReadTokensPresent bool  `json:"cache_read_tokens_present"`
 	CacheCreationTokens    int64 `json:"cache_creation_tokens"`
 	TotalTokens            int64 `json:"total_tokens"`
+	coreusage.BillingTokenDetails
 }
 
 type failDetail struct {

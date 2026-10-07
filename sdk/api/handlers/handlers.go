@@ -340,6 +340,12 @@ func setServiceTierMetadata(meta map[string]any, rawJSON []byte) {
 	}
 	serviceTier := coreusage.AutoServiceTier
 	node := gjson.GetBytes(rawJSON, "service_tier")
+	if !node.Exists() {
+		node = gjson.GetBytes(rawJSON, "serviceTier")
+	}
+	if !node.Exists() {
+		node = gjson.GetBytes(rawJSON, "speed")
+	}
 	if node.Exists() {
 		value := strings.TrimSpace(node.String())
 		if value != "" {

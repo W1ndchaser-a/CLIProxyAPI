@@ -262,6 +262,11 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		return resp, errMidSystem
 	}
 	reporter.SetTranslatedReasoningEffort(bodyForUpstream, to.String())
+	serviceTier := "default"
+	if claudeRequestUsesFastMode(bodyForUpstream, nil) {
+		serviceTier = "fast"
+	}
+	reporter.SetServiceTier(serviceTier)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyForUpstream))
 	if err != nil {
 		return resp, err
@@ -282,6 +287,9 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		return resp, errHeaders
 	}
 	fastRequest := isAnthropicUpstreamBase(baseURL) && claudeRequestIsFast(httpReq, bodyForUpstream)
+	if fastRequest {
+		reporter.SetServiceTier("fast")
+	}
 	authID, authLabel, authType, authValue := claudeAuthLogIdentity(auth)
 	helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
 		URL:       url,

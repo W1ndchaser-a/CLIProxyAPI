@@ -184,6 +184,24 @@ func MergeStreamUsageDetail(existing, update usage.Detail) usage.Detail {
 	if merged.ResponseServiceTier == "" {
 		merged.ResponseServiceTier = existing.ResponseServiceTier
 	}
+	if merged.ImageInputTokens == 0 && existing.ImageInputTokens > 0 {
+		merged.ImageInputTokens = existing.ImageInputTokens
+	}
+	if merged.ImageCacheReadTokens == 0 && existing.ImageCacheReadTokens > 0 {
+		merged.ImageCacheReadTokens = existing.ImageCacheReadTokens
+	}
+	if merged.ImageOutputTokens == 0 && existing.ImageOutputTokens > 0 {
+		merged.ImageOutputTokens = existing.ImageOutputTokens
+	}
+	if merged.CacheCreation1hTokens == 0 && existing.CacheCreation1hTokens > 0 {
+		merged.CacheCreation1hTokens = existing.CacheCreation1hTokens
+	}
+	if !merged.ImageTokensKnown && existing.ImageTokensKnown {
+		merged.ImageTokensKnown = true
+	}
+	if !merged.CacheCreationTTLKnown && existing.CacheCreationTTLKnown {
+		merged.CacheCreationTTLKnown = true
+	}
 	cached := merged.CacheReadTokens + merged.CacheCreationTokens
 	if cached == 0 {
 		cached = merged.CachedTokens

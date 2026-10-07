@@ -147,6 +147,17 @@ func (r *UsageReporter) SetStream(stream bool) {
 	r.stream = stream
 }
 
+// SetServiceTier records the client-requested service tier on the reporter.
+func (r *UsageReporter) SetServiceTier(tier string) {
+	if r == nil {
+		return
+	}
+	tier = strings.TrimSpace(tier)
+	if tier != "" {
+		r.serviceTier = tier
+	}
+}
+
 // SetSessionHierarchy sets the explicit session and parent session identifiers.
 // Callers should invoke this method before Publish or EnsurePublished on the request thread.
 func (r *UsageReporter) SetSessionHierarchy(sessionID, parentSessionID string) {
@@ -544,7 +555,11 @@ func hasNonZeroTokenUsage(detail usage.Detail) bool {
 		detail.CacheReadTokens != 0 ||
 		detail.CacheCreationTokens != 0 ||
 		detail.TotalTokens != 0 ||
-		detail.TokenBreakdown.TotalTokens != 0
+		detail.TokenBreakdown.TotalTokens != 0 ||
+		detail.ImageInputTokens != 0 ||
+		detail.ImageCacheReadTokens != 0 ||
+		detail.ImageOutputTokens != 0 ||
+		detail.CacheCreation1hTokens != 0
 }
 
 // ensurePublished guarantees that a usage record is emitted exactly once.
@@ -637,6 +652,7 @@ func (r *UsageReporter) buildRecordForModel(model string, detail usage.Detail, f
 		Failed:              failed,
 		Fail:                fail,
 		Detail:              detail,
+		BillingTokenDetails: detail.BillingTokenDetails,
 	}
 }
 
@@ -830,6 +846,7 @@ func (b *StreamUsageBuffer) Observe(detail usage.Detail, ok bool) {
 		return
 	}
 	responseServiceTier := strings.TrimSpace(detail.ResponseServiceTier)
+	preservedBilling := b.detail.BillingTokenDetails
 	if responseServiceTier == "" || hasNonZeroTokenUsage(detail) {
 		preservedTier := b.detail.ResponseServiceTier
 		b.detail = detail
@@ -838,6 +855,24 @@ func (b *StreamUsageBuffer) Observe(detail usage.Detail, ok bool) {
 		}
 	} else {
 		b.detail.ResponseServiceTier = responseServiceTier
+	}
+	if !b.detail.ImageTokensKnown && preservedBilling.ImageTokensKnown {
+		b.detail.ImageTokensKnown = true
+		if b.detail.ImageInputTokens == 0 {
+			b.detail.ImageInputTokens = preservedBilling.ImageInputTokens
+		}
+		if b.detail.ImageCacheReadTokens == 0 {
+			b.detail.ImageCacheReadTokens = preservedBilling.ImageCacheReadTokens
+		}
+		if b.detail.ImageOutputTokens == 0 {
+			b.detail.ImageOutputTokens = preservedBilling.ImageOutputTokens
+		}
+	}
+	if !b.detail.CacheCreationTTLKnown && preservedBilling.CacheCreationTTLKnown {
+		b.detail.CacheCreationTTLKnown = true
+		if b.detail.CacheCreation1hTokens == 0 {
+			b.detail.CacheCreation1hTokens = preservedBilling.CacheCreation1hTokens
+		}
 	}
 	b.ok = true
 }
@@ -959,7 +994,12 @@ func ParseCodexImageToolUsage(data []byte) (usage.Detail, bool) {
 	if !hasOpenAIStyleUsageTokenFields(usageNode) {
 		return usage.Detail{}, false
 	}
-	return parseOpenAIStyleUsageNode(usageNode), true
+	detail := parseOpenAIStyleUsageNode(usageNode)
+	if detail.OutputTokens > 0 && detail.ImageOutputTokens == 0 {
+		detail.ImageOutputTokens = detail.OutputTokens
+	}
+	detail.ImageTokensKnown = true
+	return detail, true
 }
 
 func ParseOpenAIUsage(data []byte) usage.Detail {
@@ -1009,10 +1049,13 @@ func parseOpenAIStyleUsageNode(usageNode gjson.Result) usage.Detail {
 		OutputTokens: outputNode.Int(),
 		TotalTokens:  usageNode.Get("total_tokens").Int(),
 	}
-	cached := usageNode.Get("prompt_tokens_details.cached_tokens")
-	if !cached.Exists() {
-		cached = usageNode.Get("input_tokens_details.cached_tokens")
-	}
+	cached := firstExistingUsageNode(
+		usageNode,
+		"prompt_tokens_details.cached_tokens",
+		"input_tokens_details.cached_tokens",
+		"input_details.cached_tokens",
+		"input_details.cached",
+	)
 	if cached.Exists() {
 		detail.CachedTokens = cached.Int()
 		detail.CacheReadTokens = cached.Int()
@@ -1034,6 +1077,52 @@ func parseOpenAIStyleUsageNode(usageNode gjson.Result) usage.Detail {
 	if reasoning.Exists() {
 		detail.ReasoningTokens = reasoning.Int()
 	}
+	imageInput := firstExistingUsageNode(
+		usageNode,
+		"prompt_tokens_details.image_tokens",
+		"input_tokens_details.image_tokens",
+		"prompt_tokens_details.image",
+		"input_tokens_details.image",
+		"input_details.image_tokens",
+		"input_details.image",
+		"image_input_tokens",
+	)
+	imageOutput := firstExistingUsageNode(
+		usageNode,
+		"completion_tokens_details.image_tokens",
+		"output_tokens_details.image_tokens",
+		"completion_tokens_details.image",
+		"output_tokens_details.image",
+		"output_details.image_tokens",
+		"output_details.image",
+		"image_output_tokens",
+	)
+	imageCacheRead := firstExistingUsageNode(
+		usageNode,
+		"prompt_tokens_details.cached_tokens_details.image_tokens",
+		"input_tokens_details.cached_tokens_details.image_tokens",
+		"input_details.cached_tokens_details.image_tokens",
+		"prompt_tokens_details.cached_tokens_details.image",
+		"input_tokens_details.cached_tokens_details.image",
+		"input_details.cached_tokens_details.image",
+		"prompt_tokens_details.image_cache_read_tokens",
+		"input_tokens_details.image_cache_read_tokens",
+		"image_cache_read_tokens",
+	)
+	if imageInput.Exists() {
+		detail.ImageInputTokens = imageInput.Int()
+	}
+	if imageOutput.Exists() {
+		detail.ImageOutputTokens = imageOutput.Int()
+	}
+	if imageCacheRead.Exists() {
+		detail.ImageCacheReadTokens = imageCacheRead.Int()
+	}
+	hasAnyImage := imageInput.Exists() || imageOutput.Exists() || imageCacheRead.Exists()
+	inputKnown := (detail.InputTokens == 0) || imageInput.Exists()
+	cacheKnown := (detail.CacheReadTokens == 0) || imageCacheRead.Exists()
+	outputKnown := (detail.OutputTokens == 0) || imageOutput.Exists()
+	detail.ImageTokensKnown = hasAnyImage && inputKnown && cacheKnown && outputKnown
 	if hasOpenAIStyleUsageBucketFields(usageNode) {
 		if inputNode.Exists() && outputNode.Exists() {
 			detail.TokenBreakdown = usage.NewSubsetTokenBreakdown(
@@ -1094,9 +1183,19 @@ func ParseOpenAIStreamUsage(line []byte) (usage.Detail, bool) {
 func ParseClaudeUsage(data []byte) usage.Detail {
 	usageNode := gjson.ParseBytes(data).Get("usage")
 	if !usageNode.Exists() {
+		usageNode = gjson.ParseBytes(data).Get("message.usage")
+	}
+	if !usageNode.Exists() {
+		if tier := extractResponseServiceTier(data); tier != "" {
+			return usage.Detail{ResponseServiceTier: tier}
+		}
 		return usage.Detail{}
 	}
-	return parseClaudeUsageNode(usageNode)
+	detail := parseClaudeUsageNode(usageNode)
+	if detail.ResponseServiceTier == "" {
+		detail.ResponseServiceTier = extractResponseServiceTier(data)
+	}
+	return detail
 }
 
 func ParseClaudeStreamUsage(line []byte) (usage.Detail, bool) {
@@ -1104,14 +1203,22 @@ func ParseClaudeStreamUsage(line []byte) (usage.Detail, bool) {
 	if len(payload) == 0 || !gjson.ValidBytes(payload) {
 		return usage.Detail{}, false
 	}
+	responseServiceTier := extractResponseServiceTier(payload)
 	usageNode := gjson.GetBytes(payload, "usage")
 	if !usageNode.Exists() {
 		usageNode = gjson.GetBytes(payload, "message.usage")
 	}
 	if !usageNode.Exists() {
+		if responseServiceTier != "" {
+			return usage.Detail{ResponseServiceTier: responseServiceTier}, true
+		}
 		return usage.Detail{}, false
 	}
-	return parseClaudeUsageNode(usageNode), true
+	detail := parseClaudeUsageNode(usageNode)
+	if detail.ResponseServiceTier == "" {
+		detail.ResponseServiceTier = responseServiceTier
+	}
+	return detail, true
 }
 
 func parseClaudeUsageNode(usageNode gjson.Result) usage.Detail {
@@ -1139,6 +1246,36 @@ func parseClaudeUsageNode(usageNode gjson.Result) usage.Detail {
 		// is inconsistent.
 		nonReasoningOutput = 0
 	}
+
+	var cacheCreation1hTokens int64
+	var cacheCreationTTLKnown bool
+	cacheCreationNode := usageNode.Get("cache_creation")
+	if cacheCreationNode.Exists() && cacheCreationNode.IsObject() {
+		cacheCreationTTLKnown = true
+		cacheCreation1hTokens = cacheCreationNode.Get("ephemeral_1h_input_tokens").Int()
+	} else if cacheCreation1hNode := firstExistingUsageNode(usageNode, "cache_creation_1h_tokens", "ephemeral_1h_input_tokens"); cacheCreation1hNode.Exists() {
+		cacheCreationTTLKnown = true
+		cacheCreation1hTokens = cacheCreation1hNode.Int()
+	}
+
+	var imageInputTokens, imageOutputTokens int64
+	var imageTokensKnown bool
+	imageInputNode := firstExistingUsageNode(usageNode, "input_tokens_details.image_tokens", "prompt_tokens_details.image_tokens")
+	if imageInputNode.Exists() {
+		imageTokensKnown = true
+		imageInputTokens = imageInputNode.Int()
+	}
+	imageOutputNode := firstExistingUsageNode(usageNode, "output_tokens_details.image_tokens", "completion_tokens_details.image_tokens")
+	if imageOutputNode.Exists() {
+		imageTokensKnown = true
+		imageOutputTokens = imageOutputNode.Int()
+	}
+
+	responseServiceTier := ""
+	if speedNode := firstExistingUsageNode(usageNode, "speed", "service_tier"); speedNode.Exists() {
+		responseServiceTier = strings.TrimSpace(speedNode.String())
+	}
+
 	detail := usage.Detail{
 		InputTokens:         usageNode.Get("input_tokens").Int(),
 		OutputTokens:        rawOutputTokens,
@@ -1146,6 +1283,14 @@ func parseClaudeUsageNode(usageNode gjson.Result) usage.Detail {
 		CachedTokens:        cacheReadTokens,
 		CacheReadTokens:     cacheReadTokens,
 		CacheCreationTokens: cacheCreationTokens,
+		ResponseServiceTier: responseServiceTier,
+		BillingTokenDetails: usage.BillingTokenDetails{
+			CacheCreation1hTokens: cacheCreation1hTokens,
+			CacheCreationTTLKnown: cacheCreationTTLKnown,
+			ImageInputTokens:      imageInputTokens,
+			ImageOutputTokens:     imageOutputTokens,
+			ImageTokensKnown:      imageTokensKnown,
+		},
 	}
 	if detail.CachedTokens == 0 {
 		detail.CachedTokens = detail.CacheCreationTokens
@@ -1164,6 +1309,55 @@ func parseClaudeUsageNode(usageNode gjson.Result) usage.Detail {
 	return detail
 }
 
+func extractGeminiModalities(node gjson.Result, inputTokens, cachedTokens, outputTokens int64) (imageInput, imageCacheRead, imageOutput int64, imageKnown bool) {
+	promptDetails := node.Get("promptTokensDetails")
+	if !promptDetails.Exists() {
+		promptDetails = node.Get("prompt_tokens_details")
+	}
+	candidatesDetails := node.Get("candidatesTokensDetails")
+	if !candidatesDetails.Exists() {
+		candidatesDetails = node.Get("candidates_tokens_details")
+	}
+	cacheDetails := firstExistingUsageNode(node, "cacheTokensDetails", "cache_tokens_details", "cachedContentTokensDetails", "cached_content_tokens_details")
+
+	hasAnyArray := (promptDetails.Exists() && promptDetails.IsArray()) ||
+		(candidatesDetails.Exists() && candidatesDetails.IsArray()) ||
+		(cacheDetails.Exists() && cacheDetails.IsArray())
+
+	if !hasAnyArray {
+		return 0, 0, 0, false
+	}
+
+	if promptDetails.IsArray() {
+		for _, item := range promptDetails.Array() {
+			if strings.EqualFold(strings.TrimSpace(item.Get("modality").String()), "IMAGE") {
+				imageInput += item.Get("tokenCount").Int()
+			}
+		}
+	}
+	if cacheDetails.IsArray() {
+		for _, item := range cacheDetails.Array() {
+			if strings.EqualFold(strings.TrimSpace(item.Get("modality").String()), "IMAGE") {
+				imageCacheRead += item.Get("tokenCount").Int()
+			}
+		}
+	}
+	if candidatesDetails.IsArray() {
+		for _, item := range candidatesDetails.Array() {
+			if strings.EqualFold(strings.TrimSpace(item.Get("modality").String()), "IMAGE") {
+				imageOutput += item.Get("tokenCount").Int()
+			}
+		}
+	}
+
+	inputKnown := (inputTokens == 0) || (promptDetails.Exists() && promptDetails.IsArray())
+	cacheKnown := (cachedTokens == 0) || (cacheDetails.Exists() && cacheDetails.IsArray())
+	outputKnown := (outputTokens == 0) || (candidatesDetails.Exists() && candidatesDetails.IsArray())
+
+	imageKnown = inputKnown && cacheKnown && outputKnown
+	return imageInput, imageCacheRead, imageOutput, imageKnown
+}
+
 func parseGeminiFamilyUsageDetail(node gjson.Result) usage.Detail {
 	cachedTokens := node.Get("cachedContentTokenCount").Int()
 	toolUseTokens := firstExistingUsageNode(node, "toolUsePromptTokenCount", "tool_use_prompt_token_count").Int()
@@ -1176,6 +1370,11 @@ func parseGeminiFamilyUsageDetail(node gjson.Result) usage.Detail {
 		CachedTokens:    cachedTokens,
 		CacheReadTokens: cachedTokens,
 	}
+	imageInput, imageCacheRead, imageOutput, imageKnown := extractGeminiModalities(node, detail.InputTokens, detail.CacheReadTokens, detail.OutputTokens)
+	detail.ImageInputTokens = imageInput
+	detail.ImageCacheReadTokens = imageCacheRead
+	detail.ImageOutputTokens = imageOutput
+	detail.ImageTokensKnown = imageKnown
 	if !okInput {
 		detail.TokenBreakdown = invalidUsageTokenBreakdown(detail.TotalTokens)
 		return detail
@@ -1216,6 +1415,32 @@ func parseInteractionsUsageDetail(node gjson.Result) usage.Detail {
 		CacheReadTokens:     cacheRead.Int(),
 		CacheCreationTokens: firstExistingUsageNode(node, "cache_creation_tokens", "cacheCreationTokens", "cache_write_tokens", "cacheWriteTokens").Int(),
 	}
+	imageInput, imageCacheRead, imageOutput, imageKnown := extractGeminiModalities(node, detail.InputTokens, detail.CacheReadTokens, detail.OutputTokens)
+	if !imageKnown {
+		imageInputNode := firstExistingUsageNode(node, "prompt_tokens_details.image_tokens", "input_tokens_details.image_tokens", "image_input_tokens")
+		imageOutputNode := firstExistingUsageNode(node, "candidates_tokens_details.image_tokens", "output_tokens_details.image_tokens", "image_output_tokens")
+		imageCacheReadNode := firstExistingUsageNode(node, "cache_tokens_details.image_tokens", "cached_tokens_details.image_tokens", "image_cache_read_tokens")
+		if imageInputNode.Exists() {
+			imageInput = imageInputNode.Int()
+		}
+		if imageOutputNode.Exists() {
+			imageOutput = imageOutputNode.Int()
+		}
+		if imageCacheReadNode.Exists() {
+			imageCacheRead = imageCacheReadNode.Int()
+		}
+		hasAny := imageInputNode.Exists() || imageOutputNode.Exists() || imageCacheReadNode.Exists()
+		inputKnown := (detail.InputTokens == 0) || imageInputNode.Exists()
+		cacheKnown := (detail.CacheReadTokens == 0) || imageCacheReadNode.Exists()
+		outputKnown := (detail.OutputTokens == 0) || imageOutputNode.Exists()
+		if hasAny && inputKnown && cacheKnown && outputKnown {
+			imageKnown = true
+		}
+	}
+	detail.ImageInputTokens = imageInput
+	detail.ImageCacheReadTokens = imageCacheRead
+	detail.ImageOutputTokens = imageOutput
+	detail.ImageTokensKnown = imageKnown
 	if !okInput {
 		detail.TokenBreakdown = invalidUsageTokenBreakdown(detail.TotalTokens)
 		return detail
@@ -1271,7 +1496,23 @@ func extractResponseServiceTier(payload []byte) string {
 }
 
 func extractResponseServiceTierFromValidJSON(payload []byte) string {
-	for _, path := range []string{"response.service_tier", "service_tier", "interaction.service_tier"} {
+	for _, path := range []string{
+		"response.service_tier",
+		"service_tier",
+		"interaction.service_tier",
+		"usage.service_tier",
+		"message.service_tier",
+		"response.usage.service_tier",
+		"usageMetadata.serviceTier",
+		"response.usageMetadata.serviceTier",
+		"serviceTier",
+		"response.serviceTier",
+		"usage.speed",
+		"speed",
+		"message.speed",
+		"message.usage.speed",
+		"response.speed",
+	} {
 		if tier := strings.TrimSpace(gjson.GetBytes(payload, path).String()); tier != "" {
 			return tier
 		}
