@@ -936,6 +936,40 @@ func TestUsageAdapterPropagatesNativeKeyAndAccessProvider(t *testing.T) {
 	}
 }
 
+func TestUsageAdapterPropagatesClaudeCacheCreationTTL(t *testing.T) {
+	plugin := &capturingUsagePlugin{captured: make(chan pluginapi.UsageRecord, 1)}
+	host := newHostWithRecords(capabilityRecord{
+		id: "usage-cache-ttl",
+		plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+			UsagePlugin: plugin,
+		}},
+	})
+	adapter := &usageAdapter{
+		host:     host,
+		pluginID: "usage-cache-ttl",
+	}
+
+	adapter.HandleUsage(context.Background(), coreusage.Record{
+		Provider:     "claude",
+		ExecutorType: "ClaudeExecutor",
+		Model:        "claude-opus-5",
+		Detail: coreusage.Detail{
+			InputTokens:           100,
+			OutputTokens:          20,
+			CacheCreationTokens:   1000,
+			CacheCreation1hTokens: 600,
+			CacheCreationTTLKnown: true,
+		},
+	})
+	rec := <-plugin.captured
+	if rec.Detail.CacheCreationTokens != 1000 {
+		t.Fatalf("CacheCreationTokens = %d, want 1000", rec.Detail.CacheCreationTokens)
+	}
+	if rec.Detail.CacheCreation1hTokens != 600 || !rec.Detail.CacheCreationTTLKnown {
+		t.Fatalf("cache creation ttl = (1h=%d known=%t), want (600, true)", rec.Detail.CacheCreation1hTokens, rec.Detail.CacheCreationTTLKnown)
+	}
+}
+
 func TestExecutorAdapterExecuteAttributesResponsesUsageToSelectedAuth(t *testing.T) {
 	plugin := newTestUsageCapturePlugin("plugin-provider-responses")
 	registerTestUsagePlugin(t, "test-executor-adapter-responses-auth-usage", plugin)

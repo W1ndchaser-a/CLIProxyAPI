@@ -184,6 +184,14 @@ func MergeStreamUsageDetail(existing, update usage.Detail) usage.Detail {
 	if merged.ResponseServiceTier == "" {
 		merged.ResponseServiceTier = existing.ResponseServiceTier
 	}
+	// Anthropic streams report the cache-write TTL split once (message_start) and
+	// repeat cumulative output tokens later (message_delta). Keep the split when
+	// the newer frame omits it; an explicit newer split still wins.
+	if !merged.CacheCreationTTLKnown && existing.CacheCreationTTLKnown {
+		merged.CacheCreationTTLKnown = true
+		merged.CacheCreation1hTokens = existing.CacheCreation1hTokens
+	}
+	normalizeCacheCreationTTL(&merged)
 
 	outputExcludesReasoning, knownOutput := detailOutputExcludesReasoning(update)
 	if !knownOutput {
@@ -233,7 +241,6 @@ func MergeStreamUsageDetail(existing, update usage.Detail) usage.Detail {
 		)
 		return merged
 	}
-
 	cached := merged.CacheReadTokens + merged.CacheCreationTokens
 	if cached == 0 {
 		cached = merged.CachedTokens
@@ -305,6 +312,24 @@ func detailOutputExcludesReasoning(detail usage.Detail) (bool, bool) {
 		return true, true
 	}
 	return false, false
+}
+
+// normalizeCacheCreationTTL enforces the cache-write TTL invariants: the 1-hour
+// count is a non-negative subset of CacheCreationTokens, and a split that cannot
+// cover the total stays unknown instead of being clamped into a false all-5-minute
+// report.
+func normalizeCacheCreationTTL(detail *usage.Detail) {
+	if detail == nil {
+		return
+	}
+	if !detail.CacheCreationTTLKnown {
+		detail.CacheCreation1hTokens = 0
+		return
+	}
+	if detail.CacheCreation1hTokens < 0 || detail.CacheCreation1hTokens > detail.CacheCreationTokens {
+		detail.CacheCreation1hTokens = 0
+		detail.CacheCreationTTLKnown = false
+	}
 }
 
 // IterateStreamLines splits payload by newline and invokes fn for non-empty lines.
