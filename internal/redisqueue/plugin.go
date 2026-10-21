@@ -111,6 +111,8 @@ func (p *usageQueuePlugin) HandleUsage(ctx context.Context, record coreusage.Rec
 		CacheReadTokens:        usageDetail.CacheReadTokens,
 		CacheReadTokensPresent: true,
 		CacheCreationTokens:    usageDetail.CacheCreationTokens,
+		CacheCreation1hTokens:  usageDetail.CacheCreation1hTokens,
+		CacheCreationTTLKnown:  usageDetail.CacheCreationTTLKnown,
 		TotalTokens:            usageDetail.TotalTokens,
 	}
 
@@ -230,7 +232,13 @@ type tokenStats struct {
 	CacheReadTokens        int64 `json:"cache_read_tokens"`
 	CacheReadTokensPresent bool  `json:"cache_read_tokens_present"`
 	CacheCreationTokens    int64 `json:"cache_creation_tokens"`
-	TotalTokens            int64 `json:"total_tokens"`
+	// CacheCreation1hTokens and CacheCreationTTLKnown carry the Anthropic
+	// cache-write TTL split. They are always emitted so usage sinks can tell an
+	// explicit all-5-minute result (ttl_known=true, 1h=0) from an unreported
+	// split (ttl_known=false) instead of guessing one.
+	CacheCreation1hTokens int64 `json:"cache_creation_1h_tokens"`
+	CacheCreationTTLKnown bool  `json:"cache_creation_ttl_known"`
+	TotalTokens           int64 `json:"total_tokens"`
 }
 
 type failDetail struct {

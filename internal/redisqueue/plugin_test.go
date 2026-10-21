@@ -206,6 +206,46 @@ func TestUsageQueuePluginPreservesLegacyCachedOnlyUsage(t *testing.T) {
 	})
 }
 
+func TestUsageQueuePluginEmitsClaudeCacheCreationTTL(t *testing.T) {
+	tests := []struct {
+		name    string
+		oneHour int
+		known   bool
+	}{
+		{name: "known one hour writes", oneHour: 600, known: true},
+		{name: "explicit known all five minute", oneHour: 0, known: true},
+		{name: "unknown split", oneHour: 0, known: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			withEnabledQueue(t, func() {
+				ctx := internallogging.WithResponseStatusHolder(context.Background())
+				internallogging.SetResponseStatus(ctx, http.StatusOK)
+
+				(&usageQueuePlugin{}).HandleUsage(ctx, coreusage.Record{
+					Provider:     "claude",
+					ExecutorType: "ClaudeExecutor",
+					Model:        "claude-opus-5",
+					Detail: coreusage.Detail{
+						InputTokens:           100,
+						OutputTokens:          20,
+						CacheReadTokens:       50,
+						CacheCreationTokens:   1000,
+						CacheCreation1hTokens: int64(tt.oneHour),
+						CacheCreationTTLKnown: tt.known,
+					},
+				})
+
+				payload := popSinglePayload(t)
+				tokens := requireTokensPayload(t, payload)
+				requireIntField(t, tokens, "cache_creation_tokens", 1000)
+				requireIntField(t, tokens, "cache_creation_1h_tokens", tt.oneHour)
+				requireBoolField(t, tokens, "cache_creation_ttl_known", tt.known)
+			})
+		})
+	}
+}
+
 func TestUsageQueuePluginEmitsSingleCanonicalAutoTier(t *testing.T) {
 	withEnabledQueue(t, func() {
 		ctx := coreusage.WithServiceTier(context.Background(), coreusage.AutoServiceTier)

@@ -88,9 +88,21 @@ type Detail struct {
 	CachedTokens        int64
 	CacheReadTokens     int64
 	CacheCreationTokens int64
-	TotalTokens         int64
-	TokenBreakdown      TokenBreakdown
-	ResponseServiceTier string
+	// CacheCreation1hTokens is the part of CacheCreationTokens that Anthropic
+	// reports as cache_creation.ephemeral_1h_input_tokens. It is a subset of
+	// CacheCreationTokens and is only meaningful when CacheCreationTTLKnown is
+	// true.
+	CacheCreation1hTokens int64
+	// CacheCreationTTLKnown reports whether the upstream response carried the
+	// Anthropic cache-write TTL split (cache_creation.ephemeral_5m_input_tokens
+	// and cache_creation.ephemeral_1h_input_tokens). True together with
+	// CacheCreation1hTokens == 0 is an explicit report that every cache write
+	// used the 5-minute TTL. False means the split is unknown and must not be
+	// guessed by usage sinks.
+	CacheCreationTTLKnown bool
+	TotalTokens           int64
+	TokenBreakdown        TokenBreakdown
+	ResponseServiceTier   string
 }
 
 type requestedModelAliasContextKey struct{}

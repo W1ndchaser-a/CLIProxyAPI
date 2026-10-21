@@ -155,6 +155,14 @@ func (u *claudeResponsesUsageTokens) Merge(usage gjson.Result) {
 	}
 	if cacheCreationInputTokens := usage.Get("cache_creation_input_tokens"); cacheCreationInputTokens.Exists() {
 		u.CacheCreationInputTokens = cacheCreationInputTokens.Int()
+	} else if cacheCreation := usage.Get("cache_creation"); cacheCreation.IsObject() {
+		// Anthropic always sends the flat total, but a gateway that forwards only
+		// the TTL split must still have its cache writes counted in Responses input.
+		fiveMinute := cacheCreation.Get("ephemeral_5m_input_tokens").Int()
+		oneHour := cacheCreation.Get("ephemeral_1h_input_tokens").Int()
+		if fiveMinute >= 0 && oneHour >= 0 {
+			u.CacheCreationInputTokens = fiveMinute + oneHour
+		}
 	}
 	if cacheReadInputTokens := usage.Get("cache_read_input_tokens"); cacheReadInputTokens.Exists() {
 		u.CacheReadInputTokens = cacheReadInputTokens.Int()

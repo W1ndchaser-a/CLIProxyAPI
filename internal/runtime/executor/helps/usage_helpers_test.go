@@ -364,6 +364,68 @@ func TestParseClaudeUsageIncludesCacheTokensInTotal(t *testing.T) {
 	}
 }
 
+func TestParseClaudeUsageResolvesCacheCreationTTL(t *testing.T) {
+	tests := []struct {
+		name         string
+		payload      string
+		wantCreation int64
+		wantOneHour  int64
+		wantTTLKnown bool
+	}{
+		{
+			name:         "nested split with one hour writes",
+			payload:      `{"usage":{"input_tokens":4,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":1000,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":1000}}}`,
+			wantCreation: 1000, wantOneHour: 1000, wantTTLKnown: true,
+		},
+		{
+			name:         "explicit known zero one hour",
+			payload:      `{"usage":{"input_tokens":4,"output_tokens":10,"cache_creation_input_tokens":1000,"cache_creation":{"ephemeral_5m_input_tokens":1000,"ephemeral_1h_input_tokens":0}}}`,
+			wantCreation: 1000, wantOneHour: 0, wantTTLKnown: true,
+		},
+		{
+			name:         "flat total without split stays unknown",
+			payload:      `{"usage":{"input_tokens":4,"output_tokens":10,"cache_creation_input_tokens":1000}}`,
+			wantCreation: 1000, wantOneHour: 0, wantTTLKnown: false,
+		},
+		{
+			name:         "inconsistent split stays unknown",
+			payload:      `{"usage":{"input_tokens":4,"output_tokens":10,"cache_creation_input_tokens":1000,"cache_creation":{"ephemeral_5m_input_tokens":600,"ephemeral_1h_input_tokens":100}}}`,
+			wantCreation: 1000, wantOneHour: 0, wantTTLKnown: false,
+		},
+		{
+			name:         "nested split repairs stale flat total",
+			payload:      `{"usage":{"input_tokens":4,"output_tokens":10,"cache_creation_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":200,"ephemeral_1h_input_tokens":800}}}`,
+			wantCreation: 1000, wantOneHour: 800, wantTTLKnown: true,
+		},
+		{
+			name:         "flat one hour alias without nested object",
+			payload:      `{"usage":{"input_tokens":4,"output_tokens":10,"cache_creation_input_tokens":1000,"cache_creation_1h_tokens":250}}`,
+			wantCreation: 1000, wantOneHour: 250, wantTTLKnown: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			detail := ParseClaudeUsage([]byte(tt.payload))
+			if detail.CacheCreationTokens != tt.wantCreation {
+				t.Fatalf("cache creation tokens = %d, want %d", detail.CacheCreationTokens, tt.wantCreation)
+			}
+			if detail.CacheCreation1hTokens != tt.wantOneHour {
+				t.Fatalf("cache creation 1h tokens = %d, want %d", detail.CacheCreation1hTokens, tt.wantOneHour)
+			}
+			if detail.CacheCreationTTLKnown != tt.wantTTLKnown {
+				t.Fatalf("cache creation ttl known = %t, want %t", detail.CacheCreationTTLKnown, tt.wantTTLKnown)
+			}
+			if detail.CacheCreation1hTokens > detail.CacheCreationTokens {
+				t.Fatalf("1h tokens %d exceed cache creation tokens %d", detail.CacheCreation1hTokens, detail.CacheCreationTokens)
+			}
+			wantTotal := detail.InputTokens + detail.OutputTokens + detail.CacheReadTokens + detail.CacheCreationTokens
+			if detail.TotalTokens != wantTotal {
+				t.Fatalf("total tokens = %d, want %d", detail.TotalTokens, wantTotal)
+			}
+		})
+	}
+}
+
 func TestParseClaudeUsageFallsBackCachedTokensToCacheCreation(t *testing.T) {
 	data := []byte(`{"usage":{"input_tokens":3085,"output_tokens":253,"cache_creation_input_tokens":19514}}`)
 	detail := ParseClaudeUsage(data)
@@ -427,6 +489,62 @@ func TestParseClaudeStreamUsage_MessageStart(t *testing.T) {
 	}
 	if detail.CachedTokens != 355598 {
 		t.Errorf("cached tokens = %d, want 355598", detail.CachedTokens)
+	}
+}
+
+func TestStreamUsageBufferKeepsClaudeCacheCreationTTLAcrossMessageDelta(t *testing.T) {
+	var buffer StreamUsageBuffer
+
+	buffer.ObserveClaudeStream([]byte(`data: {"type":"message_start","message":{"id":"msg_ttl","model":"claude-opus-5","usage":{"input_tokens":100,"output_tokens":1,"cache_read_input_tokens":50,"cache_creation_input_tokens":1000,"cache_creation":{"ephemeral_5m_input_tokens":400,"ephemeral_1h_input_tokens":600}}}}`))
+	// Anthropic repeats cumulative output tokens without repeating the cache
+	// split; the split must survive and the cache counters must not double.
+	buffer.ObserveClaudeStream([]byte(`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":20}}`))
+
+	detail, ok := buffer.Detail()
+	if !ok {
+		t.Fatal("expected buffered usage")
+	}
+	if detail.InputTokens != 100 || detail.OutputTokens != 20 {
+		t.Fatalf("detail = %+v, want input=100 output=20", detail)
+	}
+	if detail.CacheCreationTokens != 1000 {
+		t.Fatalf("cache creation tokens = %d, want 1000 without double counting", detail.CacheCreationTokens)
+	}
+	if !detail.CacheCreationTTLKnown || detail.CacheCreation1hTokens != 600 {
+		t.Fatalf("cache creation ttl = (known=%t 1h=%d), want (true, 600)", detail.CacheCreationTTLKnown, detail.CacheCreation1hTokens)
+	}
+	if wantTotal := int64(100 + 20 + 50 + 1000); detail.TotalTokens != wantTotal {
+		t.Fatalf("total tokens = %d, want %d", detail.TotalTokens, wantTotal)
+	}
+}
+
+func TestStreamUsageBufferClaudeDeltaCacheSplitDoesNotDoubleCount(t *testing.T) {
+	var buffer StreamUsageBuffer
+
+	buffer.ObserveClaudeStream([]byte(`data: {"type":"message_start","message":{"id":"msg_ttl","usage":{"input_tokens":7,"output_tokens":1,"cache_creation_input_tokens":1000,"cache_creation":{"ephemeral_5m_input_tokens":400,"ephemeral_1h_input_tokens":600}}}}`))
+	buffer.ObserveClaudeStream([]byte(`data: {"type":"message_delta","usage":{"output_tokens":9,"cache_creation_input_tokens":1000,"cache_creation":{"ephemeral_5m_input_tokens":400,"ephemeral_1h_input_tokens":600}}}`))
+
+	detail, ok := buffer.Detail()
+	if !ok {
+		t.Fatal("expected buffered usage")
+	}
+	if detail.CacheCreationTokens != 1000 || detail.CacheCreation1hTokens != 600 || !detail.CacheCreationTTLKnown {
+		t.Fatalf("cache creation = (total=%d known=%t 1h=%d), want (1000, true, 600)", detail.CacheCreationTokens, detail.CacheCreationTTLKnown, detail.CacheCreation1hTokens)
+	}
+}
+
+func TestStreamUsageBufferClaudeDeltaExplicitAllFiveMinuteWins(t *testing.T) {
+	var buffer StreamUsageBuffer
+
+	buffer.ObserveClaudeStream([]byte(`data: {"type":"message_start","message":{"id":"msg_ttl","usage":{"input_tokens":7,"output_tokens":1,"cache_creation_input_tokens":1000,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":1000}}}}`))
+	buffer.ObserveClaudeStream([]byte(`data: {"type":"message_delta","usage":{"output_tokens":9,"cache_creation_input_tokens":1000,"cache_creation":{"ephemeral_5m_input_tokens":1000,"ephemeral_1h_input_tokens":0}}}`))
+
+	detail, ok := buffer.Detail()
+	if !ok {
+		t.Fatal("expected buffered usage")
+	}
+	if !detail.CacheCreationTTLKnown || detail.CacheCreation1hTokens != 0 {
+		t.Fatalf("cache creation ttl = (known=%t 1h=%d), want explicit (true, 0)", detail.CacheCreationTTLKnown, detail.CacheCreation1hTokens)
 	}
 }
 
