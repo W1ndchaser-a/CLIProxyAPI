@@ -580,6 +580,7 @@ func hasNonZeroTokenUsage(detail usage.Detail) bool {
 		detail.CachedTokens != 0 ||
 		detail.CacheReadTokens != 0 ||
 		detail.CacheCreationTokens != 0 ||
+		detail.CacheCreation1hTokens != 0 ||
 		detail.TotalTokens != 0 ||
 		detail.TokenBreakdown.TotalTokens != 0
 }
@@ -935,13 +936,27 @@ func (b *StreamUsageBuffer) Observe(detail usage.Detail, ok bool) {
 	responseServiceTier := strings.TrimSpace(detail.ResponseServiceTier)
 	if responseServiceTier == "" || hasNonZeroTokenUsage(detail) {
 		preservedTier := b.detail.ResponseServiceTier
+		preservedTTLKnown := b.detail.CacheCreationTTLKnown
+		preservedCacheCreation1h := b.detail.CacheCreation1hTokens
+		preservedCacheCreation := b.detail.CacheCreationTokens
 		b.detail = detail
 		if b.detail.ResponseServiceTier == "" {
 			b.detail.ResponseServiceTier = preservedTier
 		}
+		// A later frame that only repeats cumulative output tokens (Anthropic
+		// message_delta) must not drop the cache-write TTL split reported by
+		// message_start. Only an explicit TTL report from the newer frame wins.
+		if !b.detail.CacheCreationTTLKnown && preservedTTLKnown {
+			b.detail.CacheCreationTTLKnown = true
+			b.detail.CacheCreation1hTokens = preservedCacheCreation1h
+			if b.detail.CacheCreationTokens == 0 {
+				b.detail.CacheCreationTokens = preservedCacheCreation
+			}
+		}
 	} else {
 		b.detail.ResponseServiceTier = responseServiceTier
 	}
+	normalizeCacheCreationTTL(&b.detail)
 	b.ok = true
 }
 
@@ -1222,9 +1237,58 @@ func ParseClaudeStreamUsage(line []byte) (usage.Detail, bool) {
 	return parseClaudeUsageNode(usageNode), true
 }
 
+// resolveClaudeCacheCreationTTL reads the Anthropic cache-write TTL split.
+// Anthropic reports the total on usage.cache_creation_input_tokens and splits it
+// by TTL in usage.cache_creation.ephemeral_5m_input_tokens and
+// usage.cache_creation.ephemeral_1h_input_tokens. The split is reported as known
+// only when it accounts for every cache-write token, so an explicit
+// ephemeral_1h_input_tokens of 0 is a known all-5-minute result while a missing
+// or inconsistent split stays unknown and usage sinks never guess a TTL.
+func resolveClaudeCacheCreationTTL(usageNode gjson.Result, cacheCreationTokens int64) (total, oneHour int64, known bool) {
+	if cacheCreationTokens < 0 {
+		cacheCreationTokens = 0
+	}
+	if cacheCreation := usageNode.Get("cache_creation"); cacheCreation.IsObject() {
+		ephemeral5m := cacheCreation.Get("ephemeral_5m_input_tokens")
+		ephemeral1h := cacheCreation.Get("ephemeral_1h_input_tokens")
+		if ephemeral5m.Exists() || ephemeral1h.Exists() {
+			split, okSplit := safeUsageTokenSum(ephemeral5m.Int(), ephemeral1h.Int())
+			if !okSplit {
+				return cacheCreationTokens, 0, false
+			}
+			return reconcileClaudeCacheCreationSplit(cacheCreationTokens, split, ephemeral1h.Int())
+		}
+	}
+	// Flat aliases emitted by some gateways instead of the nested object.
+	if oneHourNode := firstExistingUsageNode(usageNode, "cache_creation_1h_tokens", "cache_creation_1h_input_tokens", "ephemeral_1h_input_tokens"); oneHourNode.Exists() {
+		flatOneHour := oneHourNode.Int()
+		if flatOneHour < 0 || flatOneHour > cacheCreationTokens {
+			return cacheCreationTokens, 0, false
+		}
+		return cacheCreationTokens, flatOneHour, true
+	}
+	return cacheCreationTokens, 0, false
+}
+
+// reconcileClaudeCacheCreationSplit keeps the flat cache-write total authoritative
+// unless the TTL split is larger (a stale or missing flat count), and reports the
+// split as known only when it covers the whole cache-write total.
+func reconcileClaudeCacheCreationSplit(total, split, oneHour int64) (int64, int64, bool) {
+	if split > total {
+		total = split
+	}
+	if split != total {
+		return total, 0, false
+	}
+	return total, oneHour, true
+}
+
 func parseClaudeUsageNode(usageNode gjson.Result) usage.Detail {
 	cacheReadTokens := usageNode.Get("cache_read_input_tokens").Int()
-	cacheCreationTokens := usageNode.Get("cache_creation_input_tokens").Int()
+	cacheCreationTokens, cacheCreation1hTokens, cacheCreationTTLKnown := resolveClaudeCacheCreationTTL(
+		usageNode,
+		usageNode.Get("cache_creation_input_tokens").Int(),
+	)
 	rawOutputTokens := usageNode.Get("output_tokens").Int()
 	// Anthropic reports thinking as a subset of output_tokens. Prefer the official
 	// nested field, then fall back to legacy aliases used by some gateways.
@@ -1248,12 +1312,14 @@ func parseClaudeUsageNode(usageNode gjson.Result) usage.Detail {
 		nonReasoningOutput = 0
 	}
 	detail := usage.Detail{
-		InputTokens:         usageNode.Get("input_tokens").Int(),
-		OutputTokens:        rawOutputTokens,
-		ReasoningTokens:     reasoningTokens,
-		CachedTokens:        cacheReadTokens,
-		CacheReadTokens:     cacheReadTokens,
-		CacheCreationTokens: cacheCreationTokens,
+		InputTokens:           usageNode.Get("input_tokens").Int(),
+		OutputTokens:          rawOutputTokens,
+		ReasoningTokens:       reasoningTokens,
+		CachedTokens:          cacheReadTokens,
+		CacheReadTokens:       cacheReadTokens,
+		CacheCreationTokens:   cacheCreationTokens,
+		CacheCreation1hTokens: cacheCreation1hTokens,
+		CacheCreationTTLKnown: cacheCreationTTLKnown,
 	}
 	// Anthropic reports the speed a response was served and billed at in
 	// usage.speed ("fast" or "standard"): fast mode costs more, and a

@@ -1681,6 +1681,15 @@ type UsageDetail struct {
 	CacheReadTokens int64
 	// CacheCreationTokens is the cache creation token count.
 	CacheCreationTokens int64
+	// CacheCreation1hTokens is the subset of CacheCreationTokens written with
+	// the Anthropic 1-hour cache TTL. It is only meaningful when
+	// CacheCreationTTLKnown is true.
+	CacheCreation1hTokens int64
+	// CacheCreationTTLKnown reports whether the upstream response carried the
+	// Anthropic 5-minute/1-hour cache write TTL split. True with
+	// CacheCreation1hTokens == 0 means every cache write used the 5-minute TTL;
+	// false means the split is unknown and must not be guessed.
+	CacheCreationTTLKnown bool
 	// TotalTokens is the total token count.
 	TotalTokens int64
 }

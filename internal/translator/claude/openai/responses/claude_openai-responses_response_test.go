@@ -761,6 +761,38 @@ func TestConvertClaudeResponseToOpenAIResponses_ReportsCacheTokens(t *testing.T)
 	}
 }
 
+func TestConvertClaudeResponseToOpenAIResponses_NestedCacheCreationCountsAsInput(t *testing.T) {
+	chunks := [][]byte{
+		[]byte(`data: {"type":"message_start","message":{"id":"msg_ttl","usage":{"input_tokens":13,"output_tokens":1,"cache_read_input_tokens":100,"cache_creation":{"ephemeral_5m_input_tokens":5,"ephemeral_1h_input_tokens":2}}}}`),
+		[]byte(`data: {"type":"message_delta","usage":{"output_tokens":4}}`),
+		[]byte(`data: {"type":"message_stop"}`),
+	}
+
+	var param any
+	var completed gjson.Result
+	for _, chunk := range chunks {
+		for _, output := range ConvertClaudeResponseToOpenAIResponses(context.Background(), "claude-test", nil, nil, chunk, &param) {
+			event, data := parseClaudeResponsesSSEEvent(t, output)
+			if event == "response.completed" {
+				completed = data
+			}
+		}
+	}
+
+	if !completed.Exists() {
+		t.Fatal("expected response.completed event")
+	}
+	if got := completed.Get("response.usage.input_tokens").Int(); got != 120 {
+		t.Fatalf("response usage input_tokens = %d, want %d", got, 120)
+	}
+	if got := completed.Get("response.usage.input_tokens_details.cached_tokens").Int(); got != 100 {
+		t.Fatalf("response usage cached_tokens = %d, want %d", got, 100)
+	}
+	if got := completed.Get("response.usage.total_tokens").Int(); got != 124 {
+		t.Fatalf("response usage total_tokens = %d, want %d", got, 124)
+	}
+}
+
 func TestConvertClaudeResponseToOpenAIResponsesNonStream_ThinkingIncludesSignature(t *testing.T) {
 	signature := "claude_sig_nonstream"
 	raw := []byte(strings.Join([]string{
