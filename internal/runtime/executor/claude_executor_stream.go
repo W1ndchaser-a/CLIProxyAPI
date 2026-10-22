@@ -8,6 +8,9 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
@@ -259,7 +262,35 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		return nil, errMidSystem
 	}
 	reporter.SetTranslatedReasoningEffort(bodyForUpstream, to.String())
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyForUpstream))
+	// The upstream request outlives a client that hangs up after message_stop, so an
+	// upstream that finalises after its terminal event records completion, not a cancel.
+	// A hang-up before message_stop still cancels it at once.
+	upstreamCtx, cancelUpstream := context.WithCancel(context.WithoutCancel(ctx))
+	var upstreamStopped atomic.Bool
+	upstreamReleased := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseUpstream := func() {
+		releaseOnce.Do(func() {
+			close(upstreamReleased)
+			cancelUpstream()
+		})
+	}
+	streamHandedOff := false
+	defer func() {
+		if !streamHandedOff {
+			releaseUpstream()
+		}
+	}()
+	go func() {
+		select {
+		case <-ctx.Done():
+			if !upstreamStopped.Load() {
+				releaseUpstream()
+			}
+		case <-upstreamReleased:
+		}
+	}()
+	httpReq, err := http.NewRequestWithContext(upstreamCtx, http.MethodPost, url, bytes.NewReader(bodyForUpstream))
 	if err != nil {
 		return nil, err
 	}
@@ -341,12 +372,19 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		return nil, wrapClaudeFastRequestError(fastRequest, httpResp.StatusCode, err)
 	}
 	out := make(chan cliproxyexecutor.StreamChunk, 1)
+	streamHandedOff = true
 	go func() {
 		defer close(out)
+		drainAfterStop := false
 		defer func() {
+			if drainAfterStop {
+				go drainClaudeUpstreamAfterStop(decodedBody, releaseUpstream)
+				return
+			}
 			if errClose := decodedBody.Close(); errClose != nil {
 				log.Errorf("response body close error: %v", errClose)
 			}
+			releaseUpstream()
 		}()
 		var streamUsage helps.StreamUsageBuffer
 		defer streamUsage.Publish(ctx, reporter)
@@ -386,6 +424,9 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 					return true
 				}
 				observeClaudeSSEEvent(event.Bytes(), &upstreamMessageID, &upstreamCompleted, &upstreamStreamErr)
+				if upstreamCompleted {
+					upstreamStopped.Store(true)
+				}
 				cloned := bytes.Clone(event.Bytes())
 				event.Reset()
 				select {
@@ -445,6 +486,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				}
 			}
 			if upstreamCompleted {
+				drainAfterStop = true
 				commitClaudeContinuity(diagnosticsState, upstreamMessageID, helps.HeaderValueCaseInsensitive(httpResp.Header, "request-id"))
 				e.rememberClaudeOAuthToolAliases(body, oauthToolNamesReverseMap, upstreamMessageID)
 			}
@@ -466,6 +508,9 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			eventBuf.WriteByte('\n')
 			if len(bytes.TrimSpace(line)) == 0 {
 				observeClaudeSSEEvent(eventBuf.Bytes(), &upstreamMessageID, &upstreamCompleted, &upstreamStreamErr)
+				if upstreamCompleted {
+					upstreamStopped.Store(true)
+				}
 				eventBuf.Reset()
 			}
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
@@ -539,6 +584,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			}
 		}
 		if upstreamCompleted {
+			drainAfterStop = true
 			commitClaudeContinuity(diagnosticsState, upstreamMessageID, helps.HeaderValueCaseInsensitive(httpResp.Header, "request-id"))
 			e.rememberClaudeOAuthToolAliases(body, oauthToolNamesReverseMap, upstreamMessageID)
 		}
@@ -548,6 +594,21 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		result = wrapClaudeThinkingReplayStream(ctx, result, replayScope)
 	}
 	return result, nil
+}
+
+// claudeStreamDrainBound caps how long a stream is read after its message_stop.
+var claudeStreamDrainBound = 5 * time.Second
+
+// drainClaudeUpstreamAfterStop reads a completed stream to EOF so the upstream ends its
+// response normally, then releases the request.
+func drainClaudeUpstreamAfterStop(body io.ReadCloser, release func()) {
+	timer := time.AfterFunc(claudeStreamDrainBound, release)
+	defer release()
+	defer timer.Stop()
+	_, _ = io.Copy(io.Discard, body)
+	if errClose := body.Close(); errClose != nil {
+		log.Errorf("response body close error: %v", errClose)
+	}
 }
 
 func validateClaudeStreamingResponse(data []byte) error {
