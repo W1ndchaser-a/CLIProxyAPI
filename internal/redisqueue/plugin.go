@@ -129,6 +129,7 @@ func (p *usageQueuePlugin) HandleUsage(ctx context.Context, record coreusage.Rec
 		RejectedPredictionTokens: coreusage.CloneInt64Ptr(usageDetail.RejectedPredictionTokens),
 		TotalTokens:              usageDetail.TotalTokens,
 	}
+	_, tokens.CacheCreationTTLKnown = usageDetail.CacheCreationTTLSplit()
 
 	failed := record.Failed
 	if !failed {
@@ -288,6 +289,10 @@ type tokenStats struct {
 	AcceptedPredictionTokens *int64 `json:"accepted_prediction_tokens,omitempty"`
 	RejectedPredictionTokens *int64 `json:"rejected_prediction_tokens,omitempty"`
 	TotalTokens              int64  `json:"total_tokens"`
+	// CacheCreationTTLKnown is always emitted so usage sinks can tell an explicit
+	// all-5-minute cache-write result (true, 1h=0) from an unreported or
+	// inconsistent TTL split (false) instead of guessing one.
+	CacheCreationTTLKnown bool `json:"cache_creation_ttl_known"`
 }
 
 type failDetail struct {
