@@ -599,6 +599,7 @@ func (a *usageAdapter) HandleUsage(ctx context.Context, record coreusage.Record)
 	if apiKey == "" {
 		apiKey = strings.TrimSpace(coreusage.APIKeyFromContext(ctx))
 	}
+	cacheCreation1h, cacheCreationTTLKnown := record.Detail.CacheCreationTTLSplit()
 	a.host.dispatchPluginUsageRecord(ctx, a.pluginID, pluginapi.UsageRecord{
 		RequestID:            requestID,
 		TraceID:              traceID,
@@ -633,13 +634,15 @@ func (a *usageAdapter) HandleUsage(ctx context.Context, record coreusage.Record)
 			Body:       record.Fail.Body,
 		},
 		Detail: pluginapi.UsageDetail{
-			InputTokens:         record.Detail.InputTokens,
-			OutputTokens:        record.Detail.OutputTokens,
-			ReasoningTokens:     record.Detail.ReasoningTokens,
-			CachedTokens:        record.Detail.CachedTokens,
-			CacheReadTokens:     record.Detail.CacheReadTokens,
-			CacheCreationTokens: record.Detail.CacheCreationTokens,
-			TotalTokens:         record.Detail.TotalTokens,
+			InputTokens:           record.Detail.InputTokens,
+			OutputTokens:          record.Detail.OutputTokens,
+			ReasoningTokens:       record.Detail.ReasoningTokens,
+			CachedTokens:          record.Detail.CachedTokens,
+			CacheReadTokens:       record.Detail.CacheReadTokens,
+			CacheCreationTokens:   record.Detail.CacheCreationTokens,
+			CacheCreation1hTokens: cacheCreation1h,
+			CacheCreationTTLKnown: cacheCreationTTLKnown,
+			TotalTokens:           record.Detail.TotalTokens,
 		},
 		ResponseHeaders: cloneHeader(record.ResponseHeaders),
 	})
